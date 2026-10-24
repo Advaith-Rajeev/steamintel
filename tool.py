@@ -20,19 +20,20 @@ MAX_ROWS = 50          # cap on rows sent back to the LLM per query
 MAX_TOOL_CALLS = 10    # stop runaway loops
 
 client = genai.Client()  # reads GEMINI_API_KEY from the environment
-db = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/steam"))
+db = psycopg2.connect(os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/steamintel"))
 db.set_session(readonly=True)  # the agent can only read, never modify the DB
 _cache = {}  # key -> (expires_at, value); lives in memory, empties when the program exits
 
 SYSTEM_PROMPT = """You are SteamIntel, an assistant that answers questions about the Steam catalog
 by querying a PostgreSQL database. Call get_database_schema before writing SQL if you have not yet.
 Notes about the data:
-- Only rows with applications.success = true have real metadata; filter on it.
-- Use applications.type = 'game' unless the user asks about DLC, software, etc.
-- Prices are in cents: mat_final_price / 100.0 is the USD price. is_free marks free games.
-- There is no review score column; compute it from reviews:
-  100.0 * AVG(voted_up::int) over reviews for an appid.
-- Genres join through application_genres -> genres.genre_description.
+- Every row in game is a game (no DLC, demos or software). The data was collected in September 2025.
+- game.price_usd is the current price in dollars, after any discount; 0 or NULL means free.
+- review has one row per game: review_score_pct (0-100, % positive) and total_reviews.
+  When ranking by score, require a minimum total_reviews so games with a handful of reviews don't dominate.
+- Developers, publishers, genres and tags are many-to-many with game through
+  game_developer, game_publisher, game_genre and game_tag (join on app_id, then the *_id column).
+  Each of those tables stores its label in a column called name.
 Write only SELECT queries. Answer concisely and show the numbers you used."""
 
 
@@ -71,7 +72,7 @@ def get_database_schema() -> str:
             tables.setdefault(table, []).append(f"{column} {dtype}")
     db.rollback()
     result = "\n".join(f"{t}({', '.join(cols)})" for t, cols in tables.items())
-    store_cache("schema", result, ttl_seconds=24 * 3600)  # schema only changes when make.py runs
+    store_cache("schema", result, ttl_seconds=24 * 3600)  # schema only changes when the DB is rebuilt
     return result
 
 
@@ -102,19 +103,21 @@ def store_cache(key, value, ttl_seconds=3600):
 
 # pulling metadata about games from the database through SQL
 def get_metadata(game_ID: int) -> str:
-    """Get name, type, price, release date, genres, developers and review score for one Steam app ID."""
+    """Get name, price, discount, release date, Steam Deck status, genres, tags, developers, publishers and review score for one Steam app ID."""
     return _to_json(_query("""
-            SELECT a.appid, a.name, a.type, a.is_free, a.release_date,
-                   a.mat_final_price / 100.0 AS price_usd, a.mat_discount_percent AS discount_pct,
-                   a.short_description,
-                   (SELECT array_agg(g.genre_description) FROM application_genres ag
-                      JOIN genres g ON g.genre_id = ag.genre_id WHERE ag.appid = a.appid) AS genres,
-                   (SELECT array_agg(d.developer_name) FROM application_developers ad
-                      JOIN developers d ON d.developer_id = ad.developer_id WHERE ad.appid = a.appid) AS developers,
-                   (SELECT ROUND(100.0 * AVG(r.voted_up::int), 1) FROM reviews r
-                      WHERE r.appid = a.appid) AS review_score_pct
-            FROM applications a
-            WHERE a.appid = %s
+            SELECT g.app_id, g.name, g.release_date, g.price_usd, g.discount_pct, g.steam_deck_status,
+                   r.review_score_pct, r.total_reviews,
+                   (SELECT array_agg(ge.name) FROM game_genre gg
+                      JOIN genre ge ON ge.genre_id = gg.genre_id WHERE gg.app_id = g.app_id) AS genres,
+                   (SELECT array_agg(t.name) FROM game_tag gt
+                      JOIN tag t ON t.tag_id = gt.tag_id WHERE gt.app_id = g.app_id) AS tags,
+                   (SELECT array_agg(d.name) FROM game_developer gd
+                      JOIN developer d ON d.developer_id = gd.developer_id WHERE gd.app_id = g.app_id) AS developers,
+                   (SELECT array_agg(p.name) FROM game_publisher gp
+                      JOIN publisher p ON p.publisher_id = gp.publisher_id WHERE gp.app_id = g.app_id) AS publishers
+            FROM game g
+            LEFT JOIN review r ON r.app_id = g.app_id
+            WHERE g.app_id = %s
         """, (int(game_ID),)))  # Gemini sometimes sends numbers as floats (570.0)
 
 
@@ -146,27 +149,36 @@ def get_userLib() -> str:
 
 #  Calculate matching metadata from probable user recommendations to build a profile of recommended games
 def find_reccomendations(limit: int) -> str:
-    """Recommend games the user doesn't own that are most similar to their most-played games."""
+    """Recommend games the user doesn't own that share the most genres and tags with their most-played games."""
     owned = json.loads(get_userLib())
     if not owned:
         return "User library is empty or private."
     owned_ids = [g["appid"] for g in owned]
     top_ids = owned_ids[:10]  # the user's taste profile = their 10 most-played games
 
-    # average the description embeddings of the top games, then find the nearest unowned games
+    # profile = how often each genre/tag appears among the top games; an unowned game scores
+    # the sum of the weights of the genres/tags it shares with that profile
     return _to_json(_query("""
-            WITH profile AS (
-                SELECT AVG(description_embedding) AS v
-                FROM applications
-                WHERE appid = ANY(%s) AND description_embedding IS NOT NULL
+            WITH features AS (
+                SELECT app_id, 'genre' AS kind, genre_id AS id FROM game_genre
+                UNION ALL
+                SELECT app_id, 'tag', tag_id FROM game_tag
+            ),
+            profile AS (
+                SELECT kind, id, COUNT(*) AS weight
+                FROM features
+                WHERE app_id = ANY(%s)
+                GROUP BY kind, id
             )
-            SELECT a.appid, a.name, a.mat_final_price / 100.0 AS price_usd,
-                   ROUND((1 - (a.description_embedding <=> profile.v))::numeric, 3) AS similarity
-            FROM applications a, profile
-            WHERE a.success AND a.type = 'game'
-              AND a.description_embedding IS NOT NULL
-              AND NOT (a.appid = ANY(%s))
-            ORDER BY a.description_embedding <=> profile.v
+            SELECT g.app_id, g.name, g.price_usd, r.review_score_pct, r.total_reviews,
+                   SUM(p.weight) AS match_score
+            FROM features f
+            JOIN profile p USING (kind, id)
+            JOIN game g ON g.app_id = f.app_id
+            LEFT JOIN review r ON r.app_id = g.app_id
+            WHERE NOT (g.app_id = ANY(%s))
+            GROUP BY g.app_id, g.name, g.price_usd, r.review_score_pct, r.total_reviews
+            ORDER BY match_score DESC, r.review_score_pct DESC NULLS LAST
             LIMIT %s
         """, (top_ids, owned_ids, min(int(limit), MAX_ROWS))))
 
