@@ -1,5 +1,8 @@
 import os
 import sys
+import json
+import html
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -36,13 +39,26 @@ def push(df, table):
     df.to_sql(table, engine, if_exists='append', index=False, chunksize=5000, method='multi')
 
 
+def load_genre_aliases():
+    path = Path(__file__).resolve().parent / "genre_aliases.json"
+    mapping = json.loads(path.read_text(encoding="utf-8"))
+    return {label.casefold(): canonical for canonical, labels in mapping.items()
+            for label in (canonical, *labels)}
+
+
+def canonical_genre(name, aliases):
+    cleaned = " ".join(unicodedata.normalize("NFC", html.unescape(str(name))).split())
+    return aliases.get(cleaned.casefold(), cleaned)
+
+
 def load_lookup(csv_name, table, id_col, used_ids):
     """Load a reference table (developers, genres, ...) and return {dataset id -> our id}.
 
     The dataset's reference CSVs have columns (id, name). Our schema calls the key
     developer_id / genre_id / etc., and has UNIQUE(name).
     """
-    ref = read_csv(csv_name)
+    # Names are literal text: preserve studios named 'null' or '[Ad Space Reserved]'.
+    ref = read_csv(csv_name, keep_default_na=False)
 
     # CHANGED: only keep entries that at least one loaded game uses.
     # Why: the CSVs also cover DLC, soundtracks and demos; their developers/publishers would
@@ -55,6 +71,9 @@ def load_lookup(csv_name, table, id_col, used_ids):
     # remapped to the surviving ID instead of being lost.
     ref = ref.assign(name=ref['name'].astype(str).str.strip())
     ref = ref[ref['name'].ne('') & ref['name'].ne('nan')]
+    if table == 'genre':
+        aliases = load_genre_aliases()
+        ref['name'] = ref['name'].map(lambda name: canonical_genre(name, aliases))
     keep_id = ref.groupby('name')['id'].transform('min')
     id_map = dict(zip(ref['id'], keep_id))
 
