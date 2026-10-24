@@ -1,3 +1,8 @@
+# Dataset files (~1 GB from Zenodo): keep them local, never commit
+data/
+*.csv
+*.zip
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
